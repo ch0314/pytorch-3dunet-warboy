@@ -17,5 +17,8 @@ logs/
 pytorch3dunet.egg-info/
 dist/
 
-npu/dataset
-npu/result
+*.onnx
+*.h5
+*/dataset/
+*.h5
+npu_pipeline/examples/confocal_boundary/dataset/
