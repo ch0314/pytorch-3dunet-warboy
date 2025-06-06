@@ -1,76 +1,75 @@
 import torch
-import yaml
+import onnx
 import numpy as np
-import os
+from typing import Dict, Tuple, Optional
 from pytorch3dunet.unet3d.model import get_model
 from pytorch3dunet.unet3d.utils import load_checkpoint
-import onnx
-import onnxruntime
-from pytorch3dunet.unet3d.utils import get_logger
 from furiosa.optimizer import optimize_model
-logger = get_logger(__name__)
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ModelExporter:
-    """Handle PyTorch model export to ONNX format"""
+    """
+    Export PyTorch model to optimized ONNX format for NPU
+    """
     
-    def __init__(self, config: dict, checkpoint_path: str):
+    def __init__(self, config: Dict):
+        """
+        Initialize model exporter
+        
+        Args:
+            config: Configuration dictionary
+        """
         self.config = config
-        self.checkpoint_path = checkpoint_path
-        self.model = self._load_model()
-        self.onnx_path = None
-        self.optimized_onnx_path = None
+        self.model_config = config.get('model', {})
+        self.checkpoint_path = config.get('model_path')
         
-    def _load_model(self):
-        """Load PyTorch model from checkpoint"""
-        # Create model
-        model = get_model(self.config['model'])
+        # Extract patch configuration
+        test_config = config.get('loaders', {}).get('test', {})
+        slice_config = test_config.get('slice_builder', {})
         
-        # Load checkpoint
-        checkpoint = torch.load(self.checkpoint_path, map_location='cpu')
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        else:
-            state_dict = checkpoint
+        self.patch_shape = slice_config.get('patch_shape', [80, 170, 170])
+        self.halo_shape = slice_config.get('halo_shape', [0, 0, 0])
+        
+        # Calculate actual input shape with halo
+        self.input_shape = self._calculate_input_shape()
+        
+    def _calculate_input_shape(self) -> Tuple[int, ...]:
+        """
+        Calculate input shape considering patch and halo
+        """
+        input_shape = []
+        for p, h in zip(self.patch_shape, self.halo_shape):
+            input_shape.append(p + 2 * h)
             
-        model.load_state_dict(state_dict)
-        model.eval()
-        
-        return model
+        return tuple(input_shape)
     
-    def export(self, output_path: str) -> str:
+    def export_to_onnx(self, output_path: str) -> str:
         """
         Export model to ONNX format
         
         Args:
             output_path: Path to save ONNX model
-            dummy_input_shape: Shape of dummy input for tracing
             
         Returns:
             Path to exported ONNX file
-        """      
-        self.onnx_path = output_path
-
-        patch_shape = self.config['loaders']['test']['slice_builder']['patch_shape']  # [80, 170, 170]
-        halo_shape = self.config['loaders']['test']['slice_builder']['halo_shape']  # [16, 32, 32]
-    
-        # Calculate actual input shape with halo
-        self.input_shape = [
-            patch_shape[0] + 2 * halo_shape[0],  # 80 + 2*16 = 112
-            patch_shape[1] + 2 * halo_shape[1],  # 170 + 2*32 = 234
-            patch_shape[2] + 2 * halo_shape[2]   # 170 + 2*32 = 234
-        ]
-
+        """
+        # Load PyTorch model
+        model = self._load_pytorch_model()
+        
         # Create dummy input
-        dummy_input_shape = (1, 1, *self.input_shape)  # (1, 1, 80, 170, 170)
-        dummy_input = torch.randn(dummy_input_shape, dtype=torch.float32, requires_grad=False)
-        print(f" patch shape: {dummy_input_shape}")
-    
+        in_channels = self.model_config.get('in_channels', 1)
+        dummy_input = torch.randn(1, in_channels, *self.input_shape)
+        
+        logger.info(f"Exporting model with input shape: {dummy_input.shape}")
+        
         # Export to ONNX
         torch.onnx.export(
-            self.model,
+            model,
             dummy_input,
-            self.onnx_path,
+            output_path,
             export_params=True,
             opset_version=13,
             do_constant_folding=True,
@@ -82,73 +81,80 @@ class ModelExporter:
             }
         )
         
-        logger.info(f"Model exported to: {self.onnx_path}, verifying...")
-
-        # verification
-        if self.verify_onnx():
-            # Furiosa litmus
-            # logger.info("\n=== Furiosa litmus ===")
-            # os.system(f"furiosa litmus {output_path}")
-            self.optimize_onnx()
-            return self.optimized_onnx_path
+        logger.info(f"Model exported to: {output_path}")
+        
+        # Verify ONNX model
+        if self._verify_onnx(output_path):
+            # Optimize for NPU
+            optimized_path = self._optimize_for_npu(output_path)
+            return optimized_path
         else:
-            logger.error("\nONNX export failed")
-
+            raise RuntimeError("ONNX verification failed")
+            
+    def _load_pytorch_model(self) -> torch.nn.Module:
+        """
+        Load PyTorch model from checkpoint
+        """
+        # Create model
+        model = get_model(self.model_config)
+        
+        # Load checkpoint
+        checkpoint = torch.load(self.checkpoint_path, map_location='cpu')
+        
+        # Extract state dict
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+            
+        model.load_state_dict(state_dict)
+        model.eval()
+        
+        logger.info(f"Loaded model from: {self.checkpoint_path}")
+        
+        return model
     
-    def verify_onnx(self):
-        import onnxruntime as ort
-        from onnx import shape_inference
-        
-        logger.info(f"\nverifying: {self.onnx_path}")
-        
-        # 1. ONNX model load
-        model = onnx.load(self.onnx_path)
-        
-        # 2. Shape inference 
+    def _verify_onnx(self, model_path: str) -> bool:
+        """
+        Verify ONNX model
+        """
         try:
-            model_with_shapes = shape_inference.infer_shapes(model)
-            onnx.save(model_with_shapes, self.onnx_path.replace('.onnx', '_shaped.onnx'))
-            logger.info("Shape inference success")
-        except Exception as e:
-            logger.info(f"Shape inference warning: {e}")
-        
-        # 3. ONNX verification
-        try:
-            onnx.checker.check_model(model)
-            logger.info("ONNX model verification succeed")
-        except Exception as e:
-            logger.info(f"ONNX verification failed: {e}")
-            return False
-        
-        # 4. ONNX Runtime
-        try:
-            session = ort.InferenceSession(self.onnx_path)
-
-            input_info = session.get_inputs()[0]
+            # Check model
+            onnx_model = onnx.load(model_path)
+            onnx.checker.check_model(onnx_model)
             
-            dummy_input_shape = (1, 1, *self.input_shape)
-            test_input = np.random.randn(*dummy_input_shape).astype(np.float32)
-            outputs = session.run(None, {input_info.name: test_input})
+            # Run shape inference
+            from onnx import shape_inference
+            onnx_model = shape_inference.infer_shapes(onnx_model)
             
-            logger.info(f"\noutput shape: {outputs[0].shape}")
-            logger.info("ONNX Runtime test passed")
-
+            logger.info("ONNX model verification passed")
             return True
             
         except Exception as e:
-            logger.error(f"ONNX Runtime test failed: {e}")
+            logger.error(f"ONNX verification failed: {e}")
             return False
+            
+    def _optimize_for_npu(self, onnx_path: str) -> str:
+        """
+        Optimize ONNX model for NPU deployment
+        """
+        # Load model
+        model = onnx.load(onnx_path)
         
-    def optimize_onnx(self) -> str:
-        model = onnx.load(self.onnx_path)
-
-        self.optimized_onnx_path = self.onnx_path.replace('.onnx', '_optimized.onnx')
-        logger.info(f"Optimizing ONNX model for NPU: {self.optimized_onnx_path}")
+        # Create optimized path
+        optimized_path = onnx_path.replace('.onnx', '_optimized.onnx')
+        
+        # Apply Furiosa optimizations
+        in_channels = self.model_config.get('in_channels', 1)
         optimized_model = optimize_model(
             model=model,
             opset_version=13,
-            input_shapes={"input": [1, 1] + self.input_shape}
+            input_shapes={"input": [1, in_channels] + list(self.input_shape)}
         )
-        onnx.save(optimized_model, self.optimized_onnx_path)
-
-        return self.optimized_onnx_path
+        
+        # Save optimized model
+        onnx.save(optimized_model, optimized_path)
+        
+        logger.info(f"Optimized model saved to: {optimized_path}")
+        
+        return optimized_path

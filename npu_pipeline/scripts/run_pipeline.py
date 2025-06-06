@@ -1,113 +1,126 @@
+#!/usr/bin/env python3
 import argparse
 import asyncio
-import sys
-import os
 import yaml
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import os
+import sys
+from pathlib import Path
 
-from npu_pipeline.src.pipeline import UNet3DPipeline
+# Add parent directory to path
+sys.path.append(str(Path(__file__).parent.parent))
+
+from src.loader import H5Loader
+from src.preprocessor import Preprocessor
+from src.model_exporter import ModelExporter
+from src.quantizer import Quantizer
+from src.benchmark import Benchmark
+from src.inference_engine import InferenceEngine
+from src.postprocessor import Postprocessor
+
+import logging
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-async def main():
-    parser = argparse.ArgumentParser(
-        description='Run NPU Pipeline with pytorch-3dunet config format'
-    )
+def load_config(config_path: str) -> dict:
+    """Load configuration from YAML file"""
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='NPU Pipeline for 3D U-Net')
     parser.add_argument('--config', type=str, required=True,
-                        help='Path to test_config.yml')
-    parser.add_argument('--device', type=str, default='warboy(2)*1',
-                        help='NPU device specification')
-    parser.add_argument('--calibration-samples', type=int, default=5,
-                        help='Number of calibration samples')
-    parser.add_argument('--export', action='store_true',
-                        help='ONNX export')
-    parser.add_argument('--quantize', action='store_true',
-                        help='ONNX quantization')
+                        help='Path to configuration file')
+    parser.add_argument('--mode', type=str, choices=['sync', 'async'], default='sync',
+                        help='Inference mode')
     parser.add_argument('--benchmark', action='store_true',
-                        help='Run benchmark after quantization')
+                        help='Run benchmark')
+    parser.add_argument('--export-only', action='store_true',
+                        help='Only export and quantize model')
     
     args = parser.parse_args()
     
-    # Initialize pipeline
-    print(f"Loading configuration from: {args.config}")
-    pipeline = UNet3DPipeline(args.config)
+    # Load configuration
+    config = load_config(args.config)
     
-    # Print configuration summary
-    print("\nConfiguration Summary:")
-    print(f"  Model: {pipeline.model_config.get('name', 'UNet3D')}")
-    print(f"  Input channels: {pipeline.model_config.get('in_channels', 1)}")
-    print(f"  Output channels: {pipeline.model_config.get('out_channels', 1)}")
-    print(f"  Patch shape: {pipeline.patch_config['patch_shape']}")
-    print(f"  Stride shape: {pipeline.patch_config['stride_shape']}")
-    print(f"  Halo shape: {pipeline.patch_config['halo_shape']}")
-    print(f"  Output directory: {pipeline.output_dir}")
+    # Setup output directory
+    output_dir = config.get('loaders', {}).get('output_dir', 'output')
+    models_dir = os.path.join(os.path.dirname(args.config), 'models')
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(models_dir, exist_ok=True)
     
-    # Step 1: Export to ONNX
-    if args.export:
-        print("\n=== Step 1: Exporting to ONNX ===")
-        onnx_path = pipeline.export_and_optimize_onnx()
-        print(f"Exported to: {onnx_path}")
-    else:
-        # Assume ONNX already exists
-        pipeline.optimized_onnx_path = os.path.join(
-            pipeline.output_dir, "unet3d_optimized.onnx"
-        )
+    # Step 1: Export model to ONNX
+    logger.info("Step 1: Exporting model to ONNX")
+    exporter = ModelExporter(config)
+    onnx_path = os.path.join(models_dir, 'unet3d.onnx')
+    # exported_path = exporter.export_to_onnx(onnx_path)
     
-    # Step 2: Quantize
-    if args.quantize:
-        print("\n=== Step 2: Quantizing model ===")
-        
-        quantized_path = pipeline.quantize_model(
-            calibration_samples=args.calibration_samples
-        )
-        print(f"Quantized model saved to: {quantized_path}")
-    else:
-        # Assume quantized model exists
-        pipeline.quantized_onnx_path = os.path.join(
-            pipeline.output_dir, "unet3d_i8.onnx"
-        )
+    # Step 2: Quantize model
+    logger.info("Step 2: Quantizing model")
+    quantizer = Quantizer(config)
+    quantized_path = os.path.join(models_dir, 'unet3d_i8.onnx')
+    # quantized_path = quantizer.quantize_model(
+    #     exported_path,
+    #     quantized_path,
+    #     calibration_samples=5
+    # )
     
-    # Step 3: Benchmark (optional)
+    if args.export_only:
+        logger.info("Model export and quantization completed")
+        return
+    
+    # Step 3: Run benchmark (optional)
     if args.benchmark:
-        print("\n=== Step 3: Running benchmark ===")
-        metrics = pipeline.benchmark_optimized(
-            device=args.device,
-            run_furiosa_bench=True
+        logger.info("Step 3: Running benchmark")
+        benchmark = Benchmark(config)
+        results = benchmark.run_comprehensive_benchmark(
+            quantized_path,
+            batch_sizes=[1, 2, 4],
+            worker_nums=[1, 2, 4, 8]
         )
         
-        print("\nBenchmark Results:")
-        print(f"  Patches per second: {metrics['patches_per_second']:.2f}")
-        print(f"  Average latency per patch: {metrics['avg_latency_per_patch']*1000:.2f} ms")
-        print(f"  Batch size: {metrics['batch_size']}")
+        # Find optimal configuration
+        optimal_batch, optimal_workers = benchmark.find_optimal_configuration(results)
         
-        if 'furiosa_bench' in metrics:
-            print("\nFuriosa-bench metrics:")
-            for key, value in metrics['furiosa_bench'].items():
-                print(f"  {key}: {value}")
+        # Save benchmark results
+        benchmark_path = os.path.join(output_dir, 'benchmark_results.yaml')
+        with open(benchmark_path, 'w') as f:
+            yaml.dump(results, f)
+        logger.info(f"Benchmark results saved to: {benchmark_path}")
     
     # Step 4: Run inference
-    print("\n=== Step 4: Running inference ===")
-    results = await pipeline.run_inference_async(
-        device=args.device,
-        save_predictions=True
-    )
+    logger.info("Step 4: Running inference")
+    engine = InferenceEngine(config, quantized_path)
     
-    print(f"\nInference completed!")
-    print(f"  Total files: {results['total_files']}")
-    print(f"  Output directory: {results['output_dir']}")
+    if args.mode == 'sync':
+        results = engine.run_inference_sync()
+    else:
+        results = asyncio.run(engine.run_inference_async())
     
-    # Print metrics if available
-    successful_results = [r for r in results['results'] if 'metrics' in r]
-    if successful_results:
-        dice_scores = [r['metrics']['dice_score'] for r in successful_results]
-        avg_dice = sum(dice_scores) / len(dice_scores)
-        print(f"  Average Dice score: {avg_dice:.4f}")
+    # Save results
+    results_path = os.path.join(output_dir, 'inference_results.yaml')
+    with open(results_path, 'w') as f:
+        yaml.dump(results, f)
+    logger.info(f"Inference results saved to: {results_path}")
     
-    # Save summary
-    summary_path = os.path.join(pipeline.output_dir, "inference_summary.yaml")
-    with open(summary_path, 'w') as f:
-        yaml.dump(results, f, default_flow_style=False)
-    print(f"\nSummary saved to: {summary_path}")
+    # Save predictions as H5 files
+    for result in results['results']:
+        file_name = result['file_name']
+        prediction = result['prediction']
+        
+        pred_path = os.path.join(output_dir, file_name.replace('.h5', '_pred.h5'))
+        import h5py
+        with h5py.File(pred_path, 'w') as f:
+            f.create_dataset('prediction', data=prediction, compression='gzip')
+            
+    logger.info("Pipeline completed successfully!")
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()

@@ -1,99 +1,202 @@
 import numpy as np
-import time
-import asyncio
-from typing import Dict, Any, List
+from typing import Dict, List, Optional, Union
 from furiosa.runtime import create_runner
 from furiosa.runtime.sync import create_runner as create_runner_sync
-from pytorch3dunet.unet3d.utils import get_logger
-logger = get_logger(__name__)
+import asyncio
+from .loader import H5Loader
+from .preprocessor import Preprocessor
+from .postprocessor import Postprocessor
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class InferenceEngine:
     """
-    Optimized inference engine with patch-based processing
+    NPU inference engine with sync/async support
     """
     
-    def __init__(
-        self, 
-        model_path: str, 
-        device: str, 
-        num_workers: int,
-        patch_config: Dict[str, Any]
-    ):
-        self.model_path = model_path
-        self.device = device
-        self.num_workers = num_workers
-        self.patch_config = patch_config
-        self.batch_size = patch_config['batch_size']
+    def __init__(self, config: Dict, quantized_model_path: str):
+        """
+        Initialize inference engine
         
-    async def infer_batch_async(self, batch_data: np.ndarray) -> List[np.ndarray]:
+        Args:
+            config: Configuration dictionary
+            quantized_model_path: Path to quantized ONNX model
         """
-        Asynchronous batch inference
+        self.config = config
+        self.model_path = quantized_model_path
+        
+        # Initialize components
+        self.loader = H5Loader()
+        self.preprocessor = Preprocessor(config)
+        self.postprocessor = Postprocessor(config)
+        
+        # Extract device config
+        self.device = config.get('device', 'warboy(2)*1')
+        self.batch_size = config.get('loaders', {}).get('batch_size', 1)
+        self.num_workers = config.get('loaders', {}).get('num_workers', 8)
+        
+    def run_inference_sync(self) -> Dict:
         """
+        Run synchronous inference on test data
+        
+        Returns:
+            Dictionary of results
+        """
+        # Load test data
+        data_dict = self.loader.load_from_config(self.config)
+        
+        if 'test' not in data_dict:
+            raise ValueError("No test data found in config")
+            
+        results = []
+        
+        # Create sync runner
+        with create_runner_sync(
+            self.model_path,
+            device=self.device,
+            worker_num=self.num_workers
+        ) as runner:
+            
+            for data_info in data_dict['test']:
+                result = self._process_volume_sync(runner, data_info)
+                results.append(result)
+                
+        return {
+            'results': results,
+            'mode': 'sync',
+            'device': self.device
+        }
+    
+    async def run_inference_async(self) -> Dict:
+        """
+        Run asynchronous inference on test data
+        
+        Returns:
+            Dictionary of results
+        """
+        # Load test data
+        data_dict = self.loader.load_from_config(self.config)
+        
+        if 'test' not in data_dict:
+            raise ValueError("No test data found in config")
+            
+        results = []
+        
+        # Create async runner
         async with create_runner(
             self.model_path,
             device=self.device,
             worker_num=self.num_workers
         ) as runner:
-            # Process batch
-            outputs = await runner.run(batch_data)
-            return outputs
-    
-    def infer_batch(self, batch_data: np.ndarray) -> List[np.ndarray]:
-        """
-        Synchronous batch inference
-        """
-        with create_runner_sync(
-            self.model_path,
-            device=self.device,
-            worker_num=self.num_workers
-        ) as runner:
-            outputs = runner.run(batch_data)
-            return outputs
-    
-    def benchmark_patch_based(self, num_iterations: int = 100) -> Dict[str, float]:
-        """
-        Benchmark with realistic patch-based workload
-        """
-        # Create dummy patches
-        patch_shape = self.patch_config['patch_shape']
-        halo_shape = self.patch_config['halo_shape']
-        input_shape = [
-            patch_shape[0] + 2 * halo_shape[0],  # 80 + 2*16 = 112
-            patch_shape[1] + 2 * halo_shape[1],  # 170 + 2*32 = 234
-            patch_shape[2] + 2 * halo_shape[2]   # 170 + 2*32 = 234
-        ]
-
-        dummy_batch = np.random.randn(
-            self.batch_size, 1, *input_shape
-        ).astype(np.uint8)
-        
-        # Warmup
-        with create_runner_sync(
-            self.model_path,
-            device=self.device,
-            worker_num=self.num_workers
-        ) as runner:
-            for _ in range(10):
-                _ = runner.run(dummy_batch)
             
-            # Benchmark
-            start_time = time.time()
-            for _ in range(num_iterations):
-                _ = runner.run(dummy_batch)
-            end_time = time.time()
-        
-        # Calculate metrics
-        total_time = end_time - start_time
-        avg_latency_per_batch = total_time / num_iterations
-        avg_latency_per_patch = avg_latency_per_batch / self.batch_size
-        patches_per_second = (num_iterations * self.batch_size) / total_time
-        
+            # Process volumes concurrently
+            tasks = []
+            for data_info in data_dict['test']:
+                task = self._process_volume_async(runner, data_info)
+                tasks.append(task)
+                
+            results = await asyncio.gather(*tasks)
+            
         return {
-            'total_time': total_time,
-            'avg_latency_per_batch': avg_latency_per_batch,
-            'avg_latency_per_patch': avg_latency_per_patch,
-            'patches_per_second': patches_per_second,
-            'batch_size': self.batch_size,
-            'num_iterations': num_iterations
+            'results': results,
+            'mode': 'async',
+            'device': self.device
         }
+    
+    def _process_volume_sync(self, runner, data_info: Dict) -> Dict:
+        """
+        Process single volume synchronously
+        """
+        volume = data_info['data']
+        label = data_info.get('label')
+        file_name = data_info['file_name']
+        
+        logger.info(f"Processing {file_name}")
+        
+        # Preprocess volume into patches
+        patches_info = self.preprocessor.process_volume(volume)
+        
+        # Run inference on patches
+        predictions = []
+        
+        for i in range(0, len(patches_info), self.batch_size):
+            # Prepare batch
+            batch_patches = patches_info[i:i + self.batch_size]
+            batch_data = self.preprocessor.prepare_batch(
+                [p['patch'] for p in batch_patches]
+            )
+            
+            # Run inference
+            batch_predictions = runner.run(batch_data)
+            
+            # Store predictions with metadata
+            for j, pred in enumerate(batch_predictions):
+                predictions.append({
+                    'prediction': pred,
+                    'patch_info': batch_patches[j]
+                })
+                
+        # Postprocess predictions
+        result = self.postprocessor.process_predictions(
+            predictions,
+            volume.shape,
+            label
+        )
+        
+        result['file_name'] = file_name
+        
+        return result
+    
+    async def _process_volume_async(self, runner, data_info: Dict) -> Dict:
+        """
+        Process single volume asynchronously
+        """
+        volume = data_info['data']
+        label = data_info.get('label')
+        file_name = data_info['file_name']
+        
+        logger.info(f"Processing {file_name}")
+        
+        # Preprocess volume into patches
+        patches_info = self.preprocessor.process_volume(volume)
+        
+        # Run inference on patches
+        predictions = []
+        
+        # Process batches concurrently
+        batch_tasks = []
+        
+        for i in range(0, len(patches_info), self.batch_size):
+            # Prepare batch
+            batch_patches = patches_info[i:i + self.batch_size]
+            batch_data = self.preprocessor.prepare_batch(
+                [p['patch'] for p in batch_patches]
+            )
+            
+            # Create async task
+            task = runner.run(batch_data)
+            batch_tasks.append((task, batch_patches))
+            
+        # Wait for all batches
+        for task, batch_patches in batch_tasks:
+            batch_predictions = await task
+            
+            # Store predictions with metadata
+            for j, pred in enumerate(batch_predictions):
+                predictions.append({
+                    'prediction': pred,
+                    'patch_info': batch_patches[j]
+                })
+                
+        # Postprocess predictions
+        result = self.postprocessor.process_predictions(
+            predictions,
+            volume.shape,
+            label
+        )
+        
+        result['file_name'] = file_name
+        
+        return result
