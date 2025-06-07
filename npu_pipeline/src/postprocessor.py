@@ -179,29 +179,56 @@ class Postprocessor:
         pred_flat = prediction.flatten()
         label_flat = label.flatten()
         
-        # Calculate metrics
-        dice = f1_score(label_flat, pred_flat, average='binary')
-        iou = jaccard_score(label_flat, pred_flat, average='binary')
+        # Check if labels are binary or multiclass
+        unique_labels = np.unique(label_flat)
+        n_classes = len(unique_labels)
         
-        # Pixel-wise accuracy
-        accuracy = np.mean(pred_flat == label_flat)
+        metrics = {}
         
-        # Sensitivity and specificity
-        tp = np.sum((pred_flat == 1) & (label_flat == 1))
-        tn = np.sum((pred_flat == 0) & (label_flat == 0))
-        fp = np.sum((pred_flat == 1) & (label_flat == 0))
-        fn = np.sum((pred_flat == 0) & (label_flat == 1))
-        
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-        
-        metrics = {
-            'dice': dice,
-            'iou': iou,
-            'accuracy': accuracy,
-            'sensitivity': sensitivity,
-            'specificity': specificity
-        }
+        if n_classes == 2 and set(unique_labels) == {0, 1}:
+            # Binary classification
+            dice = f1_score(label_flat, pred_flat, average='binary')
+            iou = jaccard_score(label_flat, pred_flat, average='binary')
+            
+            # Pixel-wise accuracy
+            accuracy = np.mean(pred_flat == label_flat)
+            
+            # Sensitivity and specificity
+            tp = np.sum((pred_flat == 1) & (label_flat == 1))
+            tn = np.sum((pred_flat == 0) & (label_flat == 0))
+            fp = np.sum((pred_flat == 1) & (label_flat == 0))
+            fn = np.sum((pred_flat == 0) & (label_flat == 1))
+            
+            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+            
+            metrics = {
+                'dice': dice,
+                'iou': iou,
+                'accuracy': accuracy,
+                'sensitivity': sensitivity,
+                'specificity': specificity
+            }
+        else:
+            # Multiclass classification
+            logger.warning(f"Detected {n_classes} classes in labels: {unique_labels}")
+            
+            # For multiclass, convert prediction to binary (foreground vs background)
+            # Assuming 0 is background and all others are foreground
+            pred_binary = (pred_flat > 0).astype(int)
+            label_binary = (label_flat > 0).astype(int)
+            
+            dice = f1_score(label_binary, pred_binary, average='binary')
+            iou = jaccard_score(label_binary, pred_binary, average='binary')
+            accuracy = np.mean(pred_binary == label_binary)
+            
+            metrics = {
+                'dice': dice,
+                'iou': iou,
+                'accuracy': accuracy,
+                'n_classes_in_label': n_classes,
+                'unique_labels': unique_labels.tolist()
+            }
         
         logger.info(f"Evaluation metrics: {metrics}")
         

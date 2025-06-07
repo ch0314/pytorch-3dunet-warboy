@@ -32,10 +32,10 @@ loaders:
 
     slice_builder:
       name: SliceBuilder
-      patch_shape: [ 80, 170, 170 ]
-      stride_shape: [ 80, 170, 170 ]
+      patch_shape: [ 32, 64, 64 ]
+      stride_shape: [ 32, 64, 64 ]
       # halo around each patch
-      halo_shape: [ 16, 32, 32 ]
+      halo_shape: [ 8, 16, 16 ]
 
 
     transformer:
