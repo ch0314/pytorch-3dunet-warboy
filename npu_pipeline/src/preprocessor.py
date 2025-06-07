@@ -32,9 +32,6 @@ class Preprocessor:
         # Extract transformer config
         self.transformer_config = test_config.get('transformer', {})
         
-        # Cache for stats to avoid recalculation
-        self._stats_cache = None
-        
     def process_volume(self, volume: np.ndarray) -> List[Dict]:
         """
         Process a single volume into patches
@@ -45,12 +42,6 @@ class Preprocessor:
         Returns:
             List of patch dictionaries
         """
-        # Calculate stats once for the entire volume
-        if self._stats_cache is None:
-            logger.info("Calculating volume statistics...")
-            self._stats_cache = calculate_stats(volume)
-            logger.info(f"Stats: mean={self._stats_cache['mean']:.3f}, std={self._stats_cache['std']:.3f}")
-        
         # Create slice builder
         slice_builder = SliceBuilder(
             raw_dataset=volume,
@@ -61,16 +52,12 @@ class Preprocessor:
         
         patches = []
         
-        # Create transformer once
-        transformer = transforms.Transformer(self.transformer_config, self._stats_cache)
-        raw_transform = transformer.raw_transform()
-        
         for idx, slice_indices in enumerate(slice_builder.raw_slices):
             # Extract patch with halo
             patch_with_halo = self._extract_patch_with_halo(volume, slice_indices)
             
             # Apply transformations
-            transformed_patch = self._apply_transforms_cached(patch_with_halo, raw_transform)
+            transformed_patch = self._apply_transforms(patch_with_halo)
             
             patch_info = {
                 'patch': transformed_patch,
@@ -84,27 +71,10 @@ class Preprocessor:
         logger.info(f"Extracted {len(patches)} patches from volume of shape {volume.shape}")
         return patches
     
-    def _apply_transforms_cached(self, patch: np.ndarray, transform) -> np.ndarray:
-        """
-        Apply transformations using cached transformer
-        """
-        # Apply transformations
-        transformed = transform(patch)
-        
-        # Convert to numpy if tensor
-        if isinstance(transformed, torch.Tensor):
-            transformed = transformed.cpu().numpy()
-            
-        return transformed
-    
     def _extract_patch_with_halo(self, volume: np.ndarray, slice_indices: Tuple) -> np.ndarray:
         """
-        Extract patch with halo (padding) from volume - optimized version
+        Extract patch with halo (padding) from volume
         """
-        # Fast path for no halo
-        if all(h == 0 for h in self.halo_shape):
-            return volume[slice_indices]
-        
         # Calculate indices with halo
         padded_indices = []
         padding_needed = []
@@ -137,9 +107,29 @@ class Preprocessor:
             
         return patch
     
+    def _apply_transforms(self, patch: np.ndarray) -> np.ndarray:
+        """
+        Apply transformations to patch
+        """
+        # Calculate statistics
+        stats = calculate_stats(patch)
+        
+        # Create transformer
+        transformer = transforms.Transformer(self.transformer_config, stats)
+        raw_transform = transformer.raw_transform()
+        
+        # Apply transformations
+        transformed = raw_transform(patch)
+        
+        # Convert to numpy if tensor
+        if isinstance(transformed, torch.Tensor):
+            transformed = transformed.cpu().numpy()
+            
+        return transformed
+    
     def prepare_batch(self, patches: List[np.ndarray], for_inference: bool = True) -> np.ndarray:
         """
-        Prepare batch for NPU inference - optimized version
+        Prepare batch for NPU inference
         
         Args:
             patches: List of preprocessed patches
@@ -152,51 +142,34 @@ class Preprocessor:
         if not patches:
             raise ValueError("No patches to batch")
             
-        # Fast path for single patch
-        if len(patches) == 1:
-            patch = patches[0]
-            if patch.ndim == 3:
-                patch = np.expand_dims(patch, (0, 1))
-            elif patch.ndim == 4:
-                patch = np.expand_dims(patch, 0)
-                
-            if for_inference and patch.dtype != np.uint8:
-                patch = self._convert_to_uint8(patch)
-                
-            return patch
-            
-        # Process multiple patches
+        # Add batch dimension if needed
         processed_patches = []
         for patch in patches:
             if patch.ndim == 3:
-                patch = patch[np.newaxis, np.newaxis, ...]  # Add batch and channel dims
-            elif patch.ndim == 4:
-                patch = patch[np.newaxis, ...]  # Add batch dim
+                patch = np.expand_dims(patch, 0)  # Add channel dim
+            if patch.ndim == 4:
+                patch = np.expand_dims(patch, 0)  # Add batch dim
             processed_patches.append(patch)
             
         # Stack into batch
-        batch = np.concatenate(processed_patches, axis=0)
+        batch = np.vstack(processed_patches)
         
         # Convert to UINT8 for NPU inference
-        if for_inference and batch.dtype != np.uint8:
-            batch = self._convert_to_uint8(batch)
+        if for_inference:
+            # Normalize to [0, 255] range if needed
+            if batch.dtype == np.float32:
+                # Assuming data is already normalized to [0, 1] or standardized
+                # If standardized, denormalize first
+                if np.min(batch) < 0 or np.max(batch) > 1:
+                    # Data is standardized, convert to [0, 1]
+                    batch = (batch - np.min(batch)) / (np.max(batch) - np.min(batch))
                 
+                # Convert to [0, 255] and then to uint8
+                batch = (batch * 255).astype(np.uint8)
+            elif batch.dtype != np.uint8:
+                # Convert to uint8
+                batch = batch.astype(np.uint8)
+                
+        logger.debug(f"Prepared batch with shape {batch.shape} and dtype {batch.dtype}")
+        
         return batch
-    
-    def _convert_to_uint8(self, data: np.ndarray) -> np.ndarray:
-        """
-        Convert data to uint8 efficiently
-        """
-        if data.dtype == np.float32:
-            # Check if data is normalized to [0, 1]
-            data_min, data_max = data.min(), data.max()
-            
-            if data_min >= -0.1 and data_max <= 1.1:
-                # Data is approximately in [0, 1]
-                return np.clip(data * 255, 0, 255).astype(np.uint8)
-            else:
-                # Data needs normalization
-                data_normalized = (data - data_min) / (data_max - data_min)
-                return (data_normalized * 255).astype(np.uint8)
-        else:
-            return data.astype(np.uint8)

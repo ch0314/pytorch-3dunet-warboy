@@ -32,7 +32,6 @@ class ModelExporter:
         
         self.patch_shape = slice_config.get('patch_shape', [80, 170, 170])
         self.halo_shape = slice_config.get('halo_shape', [0, 0, 0])
-        self.batch_size = config.get('loaders', {}).get('batch_size', 1)
         
         # Calculate actual input shape with halo
         self.input_shape = self._calculate_input_shape()
@@ -62,8 +61,7 @@ class ModelExporter:
         
         # Create dummy input
         in_channels = self.model_config.get('in_channels', 1)
-        batch_size = self.batch_size
-        dummy_input = torch.randn(batch_size, in_channels, *self.input_shape)
+        dummy_input = torch.randn(1, in_channels, *self.input_shape)
         
         logger.info(f"Exporting model with input shape: {dummy_input.shape}")
         
@@ -151,7 +149,7 @@ class ModelExporter:
         optimized_model = optimize_model(
             model=model,
             opset_version=13,
-            input_shapes={"input": [self.batch_size, in_channels] + list(self.input_shape)}
+            input_shapes={"input": [1, in_channels] + list(self.input_shape)}
         )
         
         # Save optimized model
