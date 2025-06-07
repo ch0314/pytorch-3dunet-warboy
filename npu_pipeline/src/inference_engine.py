@@ -7,6 +7,7 @@ from .loader import H5Loader
 from .preprocessor import Preprocessor
 from .postprocessor import Postprocessor
 import logging
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -120,19 +121,15 @@ class InferenceEngine:
         
         # Run inference on patches
         predictions = []
-        
-        for i in range(0, len(patches_info), self.batch_size):
+
+        for i in tqdm(range(0, len(patches_info), self.batch_size), 
+                      desc=f"Inferring patches for {file_name}", 
+                      unit="patch"): 
             # Prepare batch
             batch_patches = patches_info[i:i + self.batch_size]
             batch_data = self.preprocessor.prepare_batch(
-                [p['patch'] for p in batch_patches],
-                for_inference=True  # This ensures UINT8 conversion
+                [p['patch'] for p in batch_patches]
             )
-            
-            # Verify data type
-            if batch_data.dtype != np.uint8:
-                logger.warning(f"Converting batch data from {batch_data.dtype} to uint8")
-                batch_data = batch_data.astype(np.uint8)
             
             # Run inference
             batch_predictions = runner.run(batch_data)
@@ -178,14 +175,8 @@ class InferenceEngine:
             # Prepare batch
             batch_patches = patches_info[i:i + self.batch_size]
             batch_data = self.preprocessor.prepare_batch(
-                [p['patch'] for p in batch_patches],
-                for_inference=True  # This ensures UINT8 conversion
+                [p['patch'] for p in batch_patches]
             )
-            
-            # Verify data type
-            if batch_data.dtype != np.uint8:
-                logger.warning(f"Converting batch data from {batch_data.dtype} to uint8")
-                batch_data = batch_data.astype(np.uint8)
             
             # Create async task
             task = runner.run(batch_data)

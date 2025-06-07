@@ -5,7 +5,6 @@ from furiosa.quantizer import (
     CalibrationMethod, Calibrator, quantize,
     ModelEditor, TensorType
 )
-from tqdm import tqdm
 from .loader import H5Loader
 from .preprocessor import Preprocessor
 import logging
@@ -54,21 +53,21 @@ class Quantizer:
         # Load ONNX model
         model = onnx.load(onnx_path)
         
-        # IMPORTANT: Convert input type to UINT8 before calibration
-        editor = ModelEditor(model)
-        editor.convert_input_type("input", TensorType.UINT8)
-        
         # Create calibrator
         method = getattr(CalibrationMethod, calibration_method)
         calibrator = Calibrator(model, method)
         
         # Collect calibration data
         logger.info(f"Collecting calibration data with {len(calibration_data)} samples")
-        for data in tqdm(calibration_data, desc="Calibrator"):
+        for data in calibration_data:
             calibrator.collect_data([[data]])
             
         # Compute calibration ranges
         calibration_range = calibrator.compute_range()
+        
+        # Optimize input type
+        editor = ModelEditor(model)
+        editor.convert_input_type("input", TensorType.UINT8)
         
         # Quantize model
         quantized_model = quantize(model, calibration_range)
@@ -102,14 +101,9 @@ class Quantizer:
             for patch_info in patches:
                 patch = patch_info['patch']
                 
-                # IMPORTANT: For calibration, we need float32 data
-                # The preprocessor returns data after transforms
+                # Prepare for calibration (convert to float32)
                 if patch.dtype != np.float32:
                     patch = patch.astype(np.float32)
-                    
-                # Normalize if needed
-                if np.max(patch) > 1.0:
-                    patch = patch / 255.0
                     
                 # Add batch and channel dimensions if needed
                 if patch.ndim == 3:
